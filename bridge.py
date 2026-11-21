@@ -10,7 +10,7 @@ Design (mirrors the team rules):
 - GET  /ledger?after=<unix ts>   — captain only: the full message ledger.
 - POST /revoke {member}          — captain only: kill a member's key.
 - Every message is appended to the captain's ledger (state/ledger.jsonl).
-- Rules enforced here: message length cap, quiet hours 23:00-07:00
+- Rules enforced here: message length cap (quiet hours removed 2026-11-21)
   (Asia/Shanghai) — non-captain messages are held until 07:00;
   captain messages are never held.
 Stdlib only. State lives next to this file under state/.
@@ -75,14 +75,8 @@ def append_ledger(entry):
 
 
 def quiet_hold_until(now=None):
-    """If now is inside quiet hours, return the unix ts of next 07:00 CST,
-    else 0 (no hold)."""
-    now = now or datetime.now(TZ)
-    if now.hour >= QUIET_START or now.hour < QUIET_END:
-        end = now.replace(hour=QUIET_END, minute=0, second=0, microsecond=0)
-        if now.hour >= QUIET_START:
-            end += timedelta(days=1)
-        return end.timestamp()
+    """Quiet hours REMOVED by the owner's decision on 2026-11-21: the
+    bridge never holds messages now; always return 0 (no hold)."""
     return 0
 
 
