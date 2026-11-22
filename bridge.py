@@ -3,12 +3,26 @@
 
 Design (mirrors the team rules):
 - Each member holds a secret key; the server stores only SHA-256 hashes.
-- POST /send {to, text, topic?}  — to = "group" or a member id.
+- POST /send {to, text, topic?, area?} — to = "group" or a member id.
+                                   area is optional: "work" (干活区) or
+                                   "chat" (闲聊区); stored on the queued
+                                   message and the ledger entry, and echoed
+                                   on every /poll copy, so a reply can be
+                                   filed back into the area it came from.
+                                   Old clients that never send area are
+                                   unaffected (area is null for them).
 - GET  /poll                     — fetch-and-delete: returns this member's
                                    pending messages and removes them.
 - GET  /members                  — roster + online status (seen < 30 s ago).
 - GET  /ledger?after=<unix ts>   — captain only: the full message ledger.
 - POST /revoke {member}          — captain only: kill a member's key.
+- POST /media                    — raw file bytes as the body, filename in
+                                   the X-Filename header; stores the file
+                                   under state/media/ and returns
+                                   {id, filename, size}. Cap 64 MB → 413.
+- GET  /media/<id>               — download a stored file (key required).
+                                   Messages reference media with the marker
+                                   [media:<id>:<filename>] in the text.
 - Every message is appended to the captain's ledger (state/ledger.jsonl).
 - Rules enforced here: message length cap (quiet hours removed 2026-11-21)
   (Asia/Shanghai) — non-captain messages are held until 07:00;
@@ -18,10 +32,13 @@ Stdlib only. State lives next to this file under state/.
 import hashlib
 import json
 import os
+import re
+import secrets
 import threading
 import time
 from datetime import datetime, timedelta
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from urllib.parse import quote, unquote
 from zoneinfo import ZoneInfo
 
 BASE = os.path.dirname(os.path.abspath(__file__))
@@ -30,8 +47,15 @@ os.makedirs(STATE, exist_ok=True)
 MEMBERS_FILE = os.path.join(BASE, "members.json")
 QUEUE_FILE = os.path.join(STATE, "queue.json")
 LEDGER_FILE = os.path.join(STATE, "ledger.jsonl")
+MEDIA_DIR = os.path.join(STATE, "media")
+os.makedirs(MEDIA_DIR, exist_ok=True)
+MEDIA_INDEX_FILE = os.path.join(STATE, "media_index.json")
 
 MAX_LEN = 5000
+MAX_MEDIA = 64 * 1024 * 1024
+MEDIA_TYPES = {".mp4": "video/mp4", ".png": "image/png",
+               ".jpg": "image/jpeg", ".jpeg": "image/jpeg",
+               ".webp": "image/webp"}
 TZ = ZoneInfo("Asia/Shanghai")
 QUIET_START, QUIET_END = 23, 7
 PORT = int(os.environ.get("PORT", os.environ.get("BRIDGE_PORT", "18765")))
@@ -72,6 +96,28 @@ def save_queue(q):
 def append_ledger(entry):
     with open(LEDGER_FILE, "a", encoding="utf-8") as f:
         f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+
+
+def load_media_index():
+    if os.path.exists(MEDIA_INDEX_FILE):
+        with open(MEDIA_INDEX_FILE, encoding="utf-8") as f:
+            return json.load(f)
+    return {}
+
+
+def save_media_index(idx):
+    tmp = MEDIA_INDEX_FILE + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(idx, f, ensure_ascii=False)
+    os.replace(tmp, MEDIA_INDEX_FILE)
+
+
+def sanitize_filename(name):
+    """Keep a display filename safe: no path parts, no marker-breaking
+    characters (':' and ']' would corrupt [media:<id>:<filename>])."""
+    name = unquote(name or "").replace("\\", "/").split("/")[-1].strip()
+    name = re.sub(r"[^\w.\- ]", "_", name, flags=re.UNICODE)[:128].strip()
+    return name or "file.bin"
 
 
 def quiet_hold_until(now=None):
@@ -124,8 +170,10 @@ class Handler(BaseHTTPRequestHandler):
                         if msg.get("hold_until", 0) <= now or m["role"] == "captain":
                             deliver = True
                     if deliver:
-                        mine.append({k: msg[k] for k in
-                                     ("id", "from", "to", "topic", "text", "ts")})
+                        d = {k: msg[k] for k in
+                             ("id", "from", "to", "topic", "text", "ts")}
+                        d["area"] = msg.get("area")
+                        mine.append(d)
                         if msg["to"] == "group" and msg.get("pending_for"):
                             rest.append(msg)
                     else:
@@ -162,18 +210,66 @@ class Handler(BaseHTTPRequestHandler):
                         if e.get("ts", 0) > after:
                             entries.append(e)
             return self._json(200, {"entries": entries})
+        if self.path.startswith("/media/"):
+            mid = unquote(self.path[len("/media/"):].split("?")[0])
+            if not re.fullmatch(r"[A-Za-z0-9-]+", mid or ""):
+                return self._json(404, {"error": "not found"})
+            with lock:
+                meta = load_media_index().get(mid)
+            fpath = os.path.join(MEDIA_DIR, mid)
+            if not meta or not os.path.exists(fpath):
+                return self._json(404, {"error": "not found"})
+            with open(fpath, "rb") as f:
+                data = f.read()
+            ext = os.path.splitext(meta["filename"])[1].lower()
+            ctype = MEDIA_TYPES.get(ext, "application/octet-stream")
+            self.send_response(200)
+            self.send_header("Content-Type", ctype)
+            self.send_header("Content-Length", str(len(data)))
+            self.send_header(
+                "Content-Disposition",
+                f"inline; filename*=UTF-8''{quote(meta['filename'])}")
+            self.end_headers()
+            self.wfile.write(data)
+            return
         return self._json(404, {"error": "not found"})
+
+    def _media_upload(self, m):
+        try:
+            n = int(self.headers.get("Content-Length", "0") or 0)
+        except Exception:
+            n = 0
+        if n > MAX_MEDIA:
+            self.close_connection = True
+            return self._json(413, {"error": f"file too large (>{MAX_MEDIA} bytes)"})
+        raw = self.rfile.read(n) if n else b""
+        filename = sanitize_filename(self.headers.get("X-Filename", ""))
+        mid = f"{int(time.time()*1000)}-{m['id']}-{secrets.token_hex(3)}"
+        with lock:
+            with open(os.path.join(MEDIA_DIR, mid), "wb") as f:
+                f.write(raw)
+            idx = load_media_index()
+            idx[mid] = {"filename": filename, "size": len(raw),
+                        "from": m["id"], "ts": time.time()}
+            save_media_index(idx)
+        return self._json(200, {"id": mid, "filename": filename,
+                                "size": len(raw)})
 
     def do_POST(self):
         m = self._auth()
         if not m:
             return self._json(401, {"error": "bad key"})
         last_seen[m["id"]] = time.time()
+        if self.path.startswith("/media"):
+            return self._media_upload(m)
         body = self._body()
         if self.path.startswith("/send"):
             to = str(body.get("to", ""))
             text = str(body.get("text", ""))
             topic = str(body.get("topic", ""))[:64]
+            area = str(body.get("area", "")).strip().lower()
+            if area not in ("work", "chat"):
+                area = None
             if not text:
                 return self._json(400, {"error": "empty text"})
             if len(text) > MAX_LEN:
@@ -188,6 +284,7 @@ class Handler(BaseHTTPRequestHandler):
             msg = {
                 "id": f"{int(time.time()*1000)}-{m['id']}",
                 "from": m["id"], "to": to, "topic": topic, "text": text,
+                "area": area,
                 "ts": time.time(), "hold_until": hold,
             }
             if to == "group":
@@ -198,7 +295,8 @@ class Handler(BaseHTTPRequestHandler):
                 q.append(msg)
                 save_queue(q)
                 append_ledger({k: msg[k] for k in
-                               ("id", "from", "to", "topic", "text", "ts")})
+                               ("id", "from", "to", "topic", "area",
+                                "text", "ts")})
             return self._json(200, {"ok": True, "id": msg["id"], "held": bool(hold)})
         if self.path.startswith("/revoke"):
             if m["role"] != "captain":
